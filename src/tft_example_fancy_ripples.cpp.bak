@@ -98,11 +98,11 @@ BluetoothA2DPSink a2dp_sink(i2s);
 float amplitude = 200.0;
 
 int32_t peak[] = {0, 0, 0, 0, 0, 0, 0, 0};
-float vReal[SAMPLES];
-float vImag[SAMPLES];
+double vReal[SAMPLES];
+double vImag[SAMPLES];
 
 //arduinoFFT FFT = arduinoFFT();
-ArduinoFFT<float> FFT = ArduinoFFT<float>(vReal, vImag, SAMPLES, SAMPLING_FREQUENCY);
+ArduinoFFT<double> FFT = ArduinoFFT<double>(vReal, vImag, SAMPLES, SAMPLING_FREQUENCY);
 
 double brightness = 0.15;
 
@@ -389,7 +389,7 @@ void renderFFT(void *parameter)
             // Don't use sample 0 and only first SAMPLES/2 are usable. Each array elelement represents a frequency and its value the amplitude.
             for (int i = 2; i < (SAMPLES / 2); i++)
             {
-                if (vReal[i] > 1000)
+                if (vReal[i] > 2000)
                 { // Add a crude noise filter, 10 x amplitude or more
                     createBands(i, (int)vReal[i] / amplitude);
                 }

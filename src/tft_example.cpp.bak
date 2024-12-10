@@ -1,0 +1,327 @@
+///@file tft_example.cpp
+///@brief Example code for FFT visualization on TFT display
+
+// Display
+#include <Arduino_GFX_Library.h>
+#define GFX_BL TFT_BL
+
+//Arduino_DataBus *bus = new Arduino_ESP32SPI(14 /* DC */, 10 /* CS */, 12 /* SCK */, 11 /* MOSI */, GFX_NOT_DEFINED /* MISO */, HSPI /* spi_num */);
+//Arduino_GFX *gfx = new Arduino_NV3041A(bus, GFX_NOT_DEFINED /* RST */, 0 /* rotation */, true /* IPS */);
+
+Arduino_DataBus *bus = new Arduino_ESP32SPIDMA(TFT_DC /* DC */, 
+    TFT_CS /* CS */,
+    TFT_SCLK /* SCK */,
+    TFT_MOSI /* MOSI */, 
+    GFX_NOT_DEFINED /* MISO */, 
+    HSPI /* spi_num */, 
+    false /*shared interface*/);
+Arduino_GFX *tft = new Arduino_ST7796(
+  bus, TFT_RST /* RST */, 1 /* rotation */, true /* IPS */);
+#define GFX_SPEED 80000000UL
+
+// Display Settings
+#define DISPLAY_WIDTH 320
+#define DISPLAY_HEIGHT 320
+#define NUM_BANDS 8
+#define NUM_ROWS 8
+
+// Calculate size of each "LED" block
+#define BLOCK_WIDTH (DISPLAY_WIDTH / NUM_BANDS)
+#define BLOCK_HEIGHT (DISPLAY_HEIGHT / NUM_ROWS)
+
+//TFT_eSPI tft = TFT_eSPI();
+
+
+
+
+// Code from header of original code
+// ---------------------------------
+#include "AudioFileSourcePROGMEM.h"
+#include "AudioGeneratorAAC.h"
+#include "AudioOutputI2S.h"
+#include "BluetoothA2DPSink.h"
+#include "icons.h"
+#include "sounds.h"
+
+#include <arduinoFFT.h>
+
+// Audio Settings
+// #define I2S_DOUT    A3 // A3 on QtPy
+// #define I2S_BCLK    A1 // A1 QtPy
+// #define I2S_LRC     A2 // A2 on QtPy
+#define MODE_PIN    -1
+
+#define SAMPLES 512
+#define SAMPLING_FREQUENCY 44100
+
+#define BRIGHTNESS 50
+
+#define DEVICE_NAME "bluelight2"
+
+arduinoFFT FFT = arduinoFFT();
+BluetoothA2DPSink a2dp_sink;
+
+float amplitude = 200.0;
+
+int32_t peak[] = {0, 0, 0, 0, 0, 0, 0, 0};
+double vReal[SAMPLES];
+double vImag[SAMPLES];
+
+double brightness = 0.15;
+
+QueueHandle_t queue;
+
+int16_t sample_l_int;
+int16_t sample_r_int;
+
+int visualizationCounter = 0;
+int32_t lastVisualizationUpdate = 0;
+
+static const i2s_pin_config_t pin_config = {.bck_io_num = I2S_BCLK,
+                                            .ws_io_num = I2S_LRC,
+                                            .data_out_num = I2S_DOUT,
+                                            .data_in_num = I2S_PIN_NO_CHANGE};
+
+uint8_t hueOffset = 0;
+
+// audio state management
+bool devicePlayedAudio = false;
+esp_a2d_audio_state_t currentAudioState = ESP_A2D_AUDIO_STATE_REMOTE_SUSPEND;
+
+// device connection management
+bool bleDeviceConnected = false;
+// ---------------------------------------
+
+
+// Helper function to convert HSV to RGB
+// (You might want to use your TFT library's built-in color conversion if available)
+uint16_t hsvToRGB565(uint8_t h, uint8_t s, uint8_t v) {
+    float r, g, b;
+    
+    // Convert HSV to RGB (0-255 range)
+    // ... (standard HSV to RGB conversion) ...
+    
+    // Convert to RGB565 format
+    return ((uint16_t)(r * 31) << 11) | ((uint16_t)(g * 63) << 5) | (uint16_t)(b * 31);
+}
+
+// Draw a single "LED" block
+void drawBlock(uint8_t band, uint8_t row, uint8_t hue, uint8_t sat, uint8_t val) {
+    // Calculate pixel coordinates
+    int x = band * BLOCK_WIDTH;
+    int y = row * BLOCK_HEIGHT;
+    
+    // Convert color and draw filled rectangle
+    uint16_t color = hsvToRGB565(hue, sat, val);
+    tft->fillRect(x, y, BLOCK_WIDTH, BLOCK_HEIGHT, color);
+}
+
+void createBands(int i, int dsize) {
+     uint8_t band = 0;
+  if (i <= 2) {
+    band = 0; // 125Hz
+  } else if (i <= 5) {
+    band = 1; // 250Hz
+  } else if (i <= 7) {
+    band = 2; // 500Hz
+  } else if (i <= 15) {
+    band = 3; // 1000Hz
+  } else if (i <= 30) {
+    band = 4; // 2000Hz
+  } else if (i <= 53) {
+    band = 5; // 4000Hz
+  } else if (i <= 106) {
+    band = 6; // 8000Hz
+  } else {
+    band = 7;
+  }
+  int dmax = amplitude;
+  if (dsize > dmax)
+    dsize = dmax;
+  if (dsize > peak[band]) {
+    peak[band] = dsize;
+  }
+}
+
+
+void renderFFT(void *parameter) {
+  int item = 0;
+  for (;;) {
+    if (uxQueueMessagesWaiting(queue) > 0) {
+
+      FFT.Windowing(vReal, SAMPLES, FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+      FFT.Compute(vReal, vImag, SAMPLES, FFT_FORWARD);
+      FFT.ComplexToMagnitude(vReal, vImag, SAMPLES);
+
+      for (uint8_t band = 0; band < NUM_BANDS; band++) {
+        peak[band] = 0;
+      }
+
+      // Don't use sample 0 and only first SAMPLES/2 are usable. Each array elelement represents a frequency and its value the amplitude.
+      for (int i = 2; i < (SAMPLES / 2); i++) {
+        if (vReal[i] > 2000) { // Add a crude noise filter, 10 x amplitude or more
+          createBands(i, (int)vReal[i] / amplitude);
+        }
+      }
+
+      // Release handle
+      xQueueReceive(queue, &item, 0);
+
+      uint8_t intensity;
+
+    //   FastLED.clear();
+    //   FastLED.setBrightness(BRIGHTNESS);
+
+// ---- new
+      for (byte band = 0; band < NUM_BANDS; band++) 
+        {
+            intensity = map(peak[band], 1, amplitude, 0, NUM_ROWS);
+
+        for (int i = 0; i < NUM_ROWS; i++) 
+        {
+            if (i >= intensity) {
+                // Draw empty/off block
+                drawBlock(band, NUM_ROWS - 1 - i, 0, 0, 0);
+            } else {
+                // Draw colored block
+                drawBlock(band, NUM_ROWS - 1 - i, i * 16, 255, 255);
+            }
+        }
+    }
+    // --- /new
+
+      //FastLED.show();
+
+      if ((millis() - lastVisualizationUpdate) > 1000) {
+        log_e("Fps: %f", visualizationCounter / ((millis() - lastVisualizationUpdate) / 1000.0));
+        visualizationCounter = 0;
+        lastVisualizationUpdate = millis();
+        hueOffset += 5;
+      }
+      visualizationCounter++;
+    }
+  }
+}
+
+void audio_data_callback(const uint8_t *data, uint32_t len) {
+  int item = 0;
+  // Only prepare new samples if the queue is empty
+  if (uxQueueMessagesWaiting(queue) == 0) {
+    // log_e("Queue is empty, adding new item");
+    int byteOffset = 0;
+    for (int i = 0; i < SAMPLES; i++) {
+      sample_l_int = (int16_t)(((*(data + byteOffset + 1) << 8) | *(data + byteOffset)));
+      sample_r_int = (int16_t)(((*(data + byteOffset + 3) << 8) | *(data + byteOffset + 2)));
+      vReal[i] = (sample_l_int + sample_r_int) / 2.0f;
+      vImag[i] = 0;
+      byteOffset = byteOffset + 4;
+    }
+
+    // Tell the task in core 1 that the processing can start
+    xQueueSend(queue, &item, portMAX_DELAY);
+  }
+}
+
+void connection_state_changed(esp_a2d_connection_state_t state, void *) {
+  log_i("Connection state changed, new state: %d", state);
+  if (ESP_A2D_CONNECTION_STATE_CONNECTED == state) {
+    bleDeviceConnected = true;
+  } else {
+    bleDeviceConnected = false;
+  }
+}
+
+void setup(){
+// Initialize TFT
+    #ifdef GFX_EXTRA_PRE_INIT
+        GFX_EXTRA_PRE_INIT();
+    #endif
+
+  if (!tft->begin(GFX_SPEED))
+  {
+    Serial.println("tft->begin() failed!");
+  }
+  tft->fillScreen(BLACK);
+  tft->setTextColor(WHITE, BLACK);
+  tft->setCursor(10, 10);
+  tft->setTextSize(2);
+  tft->println("FFT Example");
+  delay(2000);
+
+#ifdef GFX_BL
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR < 3)
+  ledcSetup(0, 1000, 8);
+  ledcAttachPin(GFX_BL, 0);
+  ledcWrite(0, 204);
+#else  // ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttachChannel(GFX_BL, 1000, 8, 1);
+  ledcWrite(GFX_BL, 204);
+#endif // ESP_ARDUINO_VERSION_MAJOR >= 3
+#endif // GFX_BL
+    
+    // ... (rest of your setup code) ...
+     // The queue is used for communication between A2DP callback and the FFT
+  // processor
+  queue = xQueueCreate(1, sizeof(int));
+  if (queue == NULL) {
+    log_i("Error creating the A2DP->FFT queue");
+  }
+
+  // This task will process the data acquired by the Bluetooth audio stream
+  xTaskCreatePinnedToCore(renderFFT,      // Function that should be called
+                          "FFT Renderer", // Name of the task (for debugging)
+                          10000,          // Stack size (bytes)
+                          NULL,           // Parameter to pass
+                          1,              // Task priority
+                          NULL,           // Task handle
+                          1               // Core you want to run the task on (0 or 1)
+  );
+
+  a2dp_sink.set_pin_config(pin_config);
+  
+  a2dp_sink.start((char *)DEVICE_NAME);
+  // redirecting audio data to do FFT
+  a2dp_sink.set_stream_reader(audio_data_callback);
+  a2dp_sink.set_on_connection_state_changed(connection_state_changed);
+}
+
+
+void loop() {
+  // For some reason the audio state changed callback doesn't work properly -> need to fetch the state here.
+  //
+  // Otherwise you could hook this up in setup() as sketched below.
+  //
+  // void audio_state_changed(esp_a2d_audio_state_t state, void *){
+  //   log_i("audio state: %d", state);
+  // }
+  // a2dp_sink.set_on_audio_state_changed(audio_state_changed);
+
+
+
+  esp_a2d_audio_state_t state = a2dp_sink.get_audio_state();
+  if (currentAudioState != state) {
+    log_i("Audio state changed; new state: %d", state);
+    currentAudioState = state;
+  }
+  switch (state) {
+  // Unclear how stopped and remote suspend really differ from one another. In
+  // ESP32-A2DP >= v1.6 we seem to be getting the later when the client stops
+  // audio playback.
+  case ESP_A2D_AUDIO_STATE_REMOTE_SUSPEND:
+  case ESP_A2D_AUDIO_STATE_STOPPED:
+    if (bleDeviceConnected) {
+      if (devicePlayedAudio) {
+        //drawIcon(PAUSE);
+      } else {
+        //drawIcon(BLE);
+      }
+    } else {
+      //drawIcon(HEART);
+    }
+    break;
+  case ESP_A2D_AUDIO_STATE_STARTED:
+    devicePlayedAudio = true;
+    break;
+  }
+}
+
